@@ -43,13 +43,30 @@ GATEWAY_REQUEST='
       # A request replayed from history loses the empty argument maps the
       # Anthropic-family models on this gateway require, and some backends
       # omit the call id crush correlates tool results with.
+      #
+      # The thinking models on this gateway also refuse a replayed functionCall
+      # unless the part carries back the thoughtSignature issued with it, and
+      # crush drops that part-level field once the call is stored. The reply
+      # program parks the signature in the call id, which crush replays
+      # verbatim; here it is split back out into the part the gateway wants.
       | ($body
           | if .generationConfig.thinkingConfig then del(.generationConfig.thinkingConfig.thinkingLevel) else . end
           | .contents |= (map(.parts |= (
               to_entries
               | map((.key | tostring) as $i
                   | .value |= (if .functionCall then
-                      .functionCall | (.args //= {}) | (.id //= ("call_" + $rid + "_" + $i))
+                      .functionCall
+                      | (.args //= {})
+                      | (.id //= ("call_" + $rid + "_" + $i))
+                      | (if ((.id | type) == "string" and (.id | contains("~~"))) then
+                          ((.id | split("~~"))) as $p
+                          | {functionCall: {id: $p[0], name: .name, args: .args},
+                             thoughtSignature: ($p[1:] | join("~~"))}
+                        else
+                          {functionCall: .}
+                        end)
+                    elif (.functionResponse // null) != null and ((.functionResponse | has("id"))) then
+                      .functionResponse |= (if ((.id | type) == "string" and (.id | contains("~~"))) then .id = (.id | split("~~")[0]) else . end)
                     else . end))
               | map(.value)
             )))
@@ -78,21 +95,39 @@ GATEWAY_REQUEST='
 '
 
 GATEWAY_RESPONSE='
+  # The thinking models sign every functionCall with a thoughtSignature that
+  # must be presented again when the call is replayed, attached to the same
+  # part as the call. Crush has nowhere to keep a part-level field on a tool
+  # call and drops it, so the signature is appended to the call id behind a
+  # marker; the request program splits it back out on the way back in.
+  def retitle:
+    if (.candidates // null) == null then . else
+      .candidates |= map(
+        if (.content // null) == null or (.content.parts // null) == null then . else
+          .content.parts |= map(
+            if ((.functionCall // null) != null) and ((.thoughtSignature // null) != null) then
+              .functionCall.id = (((.functionCall.id // "") | tostring) + "~~" + (.thoughtSignature | tostring))
+              | del(.thoughtSignature)
+            else . end
+          )
+        end
+      )
+    end;
   if .event then
     (.data.response // .data) as $r
     # Cumulative usage repeats on every chunk while Crush sums output tokens
     # across chunks, so the total rides only on the chunk that ends the turn.
-    | if ($r.candidates[0].finishReason // null) != null then [$r]
+    | if ($r.candidates[0].finishReason // null) != null then [$r | retitle]
       elif .final then
         # The backend sometimes omits the finish that tells Crush the answer
         # is complete; without it the reply is treated as truncated.
-        [($r | del(.usageMetadata)),
+        [($r | retitle | del(.usageMetadata)),
          {candidates: [{content: {role: "model", parts: [{text: ""}]}, finishReason: "STOP"}],
           usageMetadata: ($r.usageMetadata // {})}]
-      else [($r | del(.usageMetadata))] end
+      else [($r | retitle | del(.usageMetadata))] end
   else
     # A unary reply without usage metadata panics Crush s response mapper.
-    ((.body.response // .body) | .usageMetadata //= {})
+    ((.body.response // .body) | retitle | .usageMetadata //= {})
   end
 '
 
